@@ -26,13 +26,21 @@ application:
              name: Compatible image
              suggestions:
                   "CentOS7 [us-west-2]": { "image": "us-west-2/ami-8bbda2ea", "identity": "centos" }
+          etcd_client_port:
+             type: configuration(int)
+          etcd_server_port:
+             type: configuration(int)
         result:
           hosts: publish-signal(list<string>)
           etcd: publish-signal(list<string>)
-          machine-ids: publish-signal(list<string>)
       configuration:
+        input.etcd_client_port: 2379
+        input.etcd_server_port: 2380
+        configuration.triggers:
+          input.memberTargetQuantity: update
+        configuration.propagateStatus: [ update ]
         configuration.workflows:
-          launch: 
+          update: &update 
             steps:
               - provisionCluster:
                   action: provisionVms
@@ -49,6 +57,16 @@ application:
                           volumeSize: 15
                           deleteOnTermination: true
                       "/dev/sdb": ephemeral0
+                    providerSettings:
+                        userData:
+                            |
+                            #cloud-config
+                            packages:
+                              - etcd
+                            runcmd:
+                              - echo "" >/etc/machine-id
+                              - systemd-machine-id-setup
+                              
                   output:
                     ips: ips
                     privateips: privateips
@@ -61,122 +79,38 @@ application:
                     vmIdentity: "{$.operating-system.identity}"
                     roleName: single
                     staticIps: ["{$.ips[0]}"]
-              - update-machine-id:
-                  action: execrun
-                  precedingPhases: [provision-single-node]
-                  parameters:
-                    isSudo: true
-                    roles: [docker]
-                    command:
-                      - |
-                        echo "" >/etc/machine-id
-                        systemd-machine-id-setup
-                        cat /etc/machine-id
-                  output:
-                    machine-ids: stdout
               - etcd-initial-cluster:
                   action: serialize
-                  precedingPhases: [ update-machine-id ]
+                  phase: createUrls
+                  precedingPhases: [  provision-single-node ]
                   parameters:
                     format: CSV
-                    input: [ "{$.privateips}=http://{$.privateips}:2380" ]
+                    input: [ "{$.privateips}=http://{$.privateips}:{$.etcd_server_port}" ]
                   output:
                     etcd_cluster: serialized
-              - install-etcd-service:
-                  action: execrun
-                  precedingPhases: [etcd-initial-cluster]
+              - etcd-initial-cluster-urls:
+                  action: serialize
+                  phase: createUrls
+                  precedingPhases: [  provision-single-node ]
                   parameters:
-                    isSudo: true
-                    roles: [docker]
-                    command:
-                      - |
-                        yum install -y etcd
-                        ETCD_CLUSTER=`echo {$.etcd_cluster}`
-                        cat <<EEND > /etc/etcd/etcd.conf
-                        ETCD_NAME=`hostname -i`
-                        ETCD_DATA_DIR="/var/lib/etcd/default.etcd"
-                        ETCD_LISTEN_PEER_URLS="http://`hostname -i`:2380"
-                        ETCD_LISTEN_CLIENT_URLS="http://0.0.0.0:2379"
-                        ETCD_INITIAL_CLUSTER="$$ETCD_CLUSTER"
-                        ETCD_INITIAL_ADVERTISE_PEER_URLS="http://`hostname -i`:2380"
-                        EEND
-              - install-docker:
-                  action: execrun
-                  precedingPhases: [install-etcd-service]
-                  parameters:
-                    isSudo: true
-                    roles: [docker]
-                    command:
-                      - |
-                        curl -sSL https://get.docker.com/ | sh
-              - update-docker-service:
-                  action: execrun
-                  precedingPhases: [install-docker]
-                  parameters:
-                    isSudo: true
-                    roles: [docker]
-                    command:
-                      - |
-                        cat <<EEND >/usr/lib/systemd/system/docker.service
-                        [Unit]
-                        Description=Docker Application Container Engine
-                        Documentation=https://docs.docker.com
-                        After=network.target docker.socket
-                        Requires=docker.socket
-                        
-                        [Service]
-                        Type=notify
-                        Environment=/etc/sysconfig/docker
-                        ExecStart=/usr/bin/docker daemon -H fd:// -H 0.0.0.0:2376 --cluster-store etcd://127.0.0.1:2379 --cluster-advertise=`hostname -i`:2376
-                        MountFlags=slave
-                        LimitNOFILE=1048576
-                        LimitNPROC=1048576
-                        LimitCORE=infinity
-                        
-                        [Install]
-                        WantedBy=multi-user.target
-                        EEND
-              - install-fleet:
-                  action: execrun
-                  precedingPhases: [install-docker]
-                  parameters:
-                    isSudo: true
-                    roles: [docker]
-                    command:
-                      - |
-                        curl -kLO https://github.com/coreos/fleet/releases/download/v0.11.5/fleet-v0.11.5-linux-amd64.tar.gz
-                        tar -zxf fleet-v0.11.5-linux-amd64.tar.gz
-                        mv fleet-v0.11.5-linux-amd64/* /usr/local/bin/
-                        cat <<EEND > /etc/systemd/system/fleet.service
-                        [Unit]
-                        Description=fleet
-                        
-                        [Service]
-                        Environment=FLEET_PUBLIC_IP=`hostname -i`
-                        Environment=FLEET_METADATA="public_ip=`hostname -i`,region=us-west-2,instance-type=m3.medium"
-                        Environment=FLEET_ETCD_SERVERS="http://127.0.0.1:2379"
-                        Environment=FLEET_SSH_USERNAME="{$.operating-system.identity}"
-                        ExecStart=/usr/local/bin/fleetd
-                        User=root
-                        Group=root
-                        EEND
-                        cat <<EEND > /etc/systemd/system/fleet.socket
-                        [Unit]
-                        Description=Fleet API Socket
-                        PartOf=fleet.service
-                        
-                        [Socket]
-                        ListenStream=/var/run/fleet.sock
-                        EEND
+                    format: CSV
+                    input: ["http://{$.privateips}:{$.etcd_client_port}"]
+                  output:
+                    etcd_cluster_urls: serialized
               - generate-ssh-key:
                   action: execrun
-                  precedingPhases: [install-fleet]
+                  precedingPhases: [createUrls]
                   parameters:
                     isSudo: false
                     roles: [ docker ]
                     command:
                       - |
-                        ssh-keygen -q -t rsa -f ~/.ssh/id_rsa -N ''
+                        if [[ -f ~/.ssh/id_rsa ]]; then
+                          cat ~/.ssh/id_rsa.pub
+                          exit 0 
+                        else
+                          ssh-keygen -q -t rsa -f ~/.ssh/id_rsa -N ''
+                        fi
                         cat ~/.ssh/id_rsa.pub
                         echo 'eval `ssh-agent`' >> ~/.bash_profile
                         echo 'ssh-add ~/.ssh/id_rsa' >> ~/.bash_profile
@@ -202,38 +136,113 @@ application:
                         cat <<EEND | xargs -n 1 echo >> ~/.ssh/authorized_keys
                         {$.pubkeys}
                         EEND
-              - start-services:
+              - install-etcd-service:
                   action: execrun
                   precedingPhases: [update-authorized-hosts]
                   parameters:
+                    batchSize: 1
                     isSudo: true
-                    roles: [ docker ]
+                    roles: [docker]
                     command:
                       - |
+                        curl -o /usr/bin/jq -kLO https://github.com/stedolan/jq/releases/download/jq-1.5/jq-linux64
+                        chmod +x /usr/bin/jq
+                        curl -sSL https://s3-us-west-2.amazonaws.com/tonomi-field/etcd_cluster_management.sh |ETCD_CLIENT_PORT={$.etcd_client_port} ETCD_SERVER_PORT={$.etcd_server_port} ETCD_CLUSTER=`echo {$.etcd_cluster}` ETCD_PEER_URLS=`echo {$.etcd_cluster_urls}` sh
+              - install-docker:
+                  action: execrun
+                  precedingPhases: [install-etcd-service]
+                  parameters:
+                    isSudo: true
+                    roles: [docker]
+                    command:
+                      - |
+                        [[ -f /usr/lib/systemd/system/docker.service ]] && exit 0 ||
+                        curl -sSL https://get.docker.com/ | sh
+              - update-docker-service:
+                  action: execrun
+                  precedingPhases: [install-docker]
+                  parameters:
+                    isSudo: true
+                    roles: [docker]
+                    command:
+                      - |
+                        cat <<EEND >/usr/lib/systemd/system/docker.service
+                        [Unit]
+                        Description=Docker Application Container Engine
+                        Documentation=https://docs.docker.com
+                        After=network.target docker.socket
+                        Requires=docker.socket
+                        
+                        [Service]
+                        Type=notify
+                        Environment=/etc/sysconfig/docker
+                        ExecStart=/usr/bin/docker daemon -H fd:// -H 0.0.0.0:2376 --cluster-store etcd://127.0.0.1:{$.etcd_client_port} --cluster-advertise=`hostname -i`:2376
+                        MountFlags=slave
+                        LimitNOFILE=1048576
+                        LimitNPROC=1048576
+                        LimitCORE=infinity
+                        
+                        [Install]
+                        WantedBy=multi-user.target
+                        EEND
                         systemctl daemon-reload
-                        systemctl enable etcd.service
+                        systemctl enable docker.service
+                        systemctl stop docker.service
+                        systemctl start docker.service
+              - install-fleet:
+                  action: execrun
+                  precedingPhases: [update-docker-service]
+                  parameters:
+                    isSudo: true
+                    roles: [docker]
+                    command:
+                      - |
+                        [[ -f /usr/local/bin/fleetctl ]] && exit 0 ||
+                        curl -kLO https://github.com/coreos/fleet/releases/download/v0.11.5/fleet-v0.11.5-linux-amd64.tar.gz
+                        tar -zxf fleet-v0.11.5-linux-amd64.tar.gz
+                        mv fleet-v0.11.5-linux-amd64/* /usr/local/bin/
+                        cat <<EEND > /etc/systemd/system/fleet.service
+                        [Unit]
+                        Description=fleet
+                        
+                        [Service]
+                        Environment=FLEET_PUBLIC_IP=`hostname -i`
+                        Environment=FLEET_METADATA="public_ip=`hostname -i`,region=us-west-2,instance-type=m3.medium"
+                        Environment=FLEET_ETCD_SERVERS="http://127.0.0.1:{$.etcd_client_port}"
+                        Environment=FLEET_SSH_USERNAME="{$.operating-system.identity}"
+                        ExecStart=/usr/local/bin/fleetd
+                        User=root
+                        Group=root
+                        EEND
+                        cat <<EEND > /etc/systemd/system/fleet.socket
+                        [Unit]
+                        Description=Fleet API Socket
+                        PartOf=fleet.service
+                        
+                        [Socket]
+                        ListenStream=/var/run/fleet.sock
+                        EEND
+                        systemctl daemon-reload
                         systemctl enable fleet.socket
                         systemctl enable fleet.service
-                        systemctl enable docker.service
-                        systemctl start etcd.service
+                        systemctl stop fleet.socket
+                        systemctl stop fleet.service
                         systemctl start fleet.socket
                         systemctl start fleet.service
-                        systemctl start docker.service
               - create-docker-network:
                   action: execrun
-                  precedingPhases: [start-services]
+                  precedingPhases: [install-fleet]
                   parameters:
                     isSudo: true
                     roles: [ single ]
                     command:
                       - |
+                        [[ $$( docker network ls |grep SkyNet) ]] && exit 0 ||
                         docker network create --driver overlay SkyNet
-                        
             return:
               hosts:
                 value: "{$.ips}"
               etcd:
-                value: "http://{$.ips}:2379/v2/keys/docker/"
-              machine-ids:
-                value: "{$.machine-ids[*]}"
-   
+                value: "http://{$.ips}:{$.etcd_client_port}/v2/keys/docker/nodes"
+      
+          launch: *update   
